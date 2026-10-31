@@ -1,80 +1,93 @@
 #include <Arduino.h>
-#include <wiring_private.h>
+#include <SoftwareSerial.h>
 
-// MAX485 回路の RXD(RO)→D2、TXD(DI)←D4。サーボは ID 1、1 Mbps。
+// サーボ ID 1、115200 bps。D2 は受信、D4 は送信。
 constexpr uint8_t SERVO_ID = 1;
 constexpr uint16_t SPEED = 300;
+SoftwareSerial servo(PIN_D02, PIN_D04);
 
-// 1 Mbps は SPRESENSE 標準 SoftwareSerial の対象外のため、GPIO を直接操作する。
-#define DEMCR (*(volatile uint32_t *)0xE000EDFC)
-#define DWT_CTRL (*(volatile uint32_t *)0xE0001000)
-#define DWT_CYCCNT (*(volatile uint32_t *)0xE0001004)
-volatile uint32_t *txPin;
-uint32_t bitCycles;
-
-void waitUntil(uint32_t time) {
-  while (static_cast<int32_t>(DWT_CYCCNT - time) < 0) {}
-}
-
-// 8N1: スタートビット、データ 8 ビット、ストップビットを送る。
-void sendByte(uint8_t value) {
-  uint32_t time = DWT_CYCCNT;
-  *txPin = GPIO_OUTPUT_LOW;
-  for (int bit = 0; bit < 8; ++bit) {
-    time += bitCycles;
-    waitUntil(time);
-    *txPin = (value & 1) ? GPIO_OUTPUT_HIGH : GPIO_OUTPUT_LOW;
-    value >>= 1;
+// FEETECH のパケット: FF FF ID 長さ 命令 パラメータ チェックサム。
+void sendPacket(uint8_t instruction, const uint8_t *params, uint8_t count) {
+  uint8_t checksum = SERVO_ID + count + 2 + instruction;
+  servo.write(0xff);
+  servo.write(0xff);
+  servo.write(SERVO_ID);
+  servo.write(count + 2);
+  servo.write(instruction);
+  for (uint8_t i = 0; i < count; ++i) {
+    servo.write(params[i]);
+    checksum += params[i];
   }
-  time += bitCycles;
-  waitUntil(time);
-  *txPin = GPIO_OUTPUT_HIGH;
-  waitUntil(time + bitCycles);
+  servo.write(uint8_t(~checksum));
 }
 
-// 応答を使わず書き込み指令を送る。EEPROM の設定は変更しない。
-void sendWrite(const uint8_t *params, uint8_t count) {
-  uint8_t sum = SERVO_ID + count + 2 + 3;
-  noInterrupts();
-  sendByte(0xff); sendByte(0xff); sendByte(SERVO_ID);
-  sendByte(count + 2); sendByte(3);
-  for (uint8_t i = 0; i < count; ++i) { sendByte(params[i]); sum += params[i]; }
-  sendByte(~sum);
-  interrupts();
-}
-
-// 加速度、目標位置、時間、速度を連続して書き込む。
 void moveTo(int position) {
+  // レジスタ41から、加速度・位置・時間・速度を順に書き込む。
   const uint8_t params[] = {41, 50, uint8_t(position), uint8_t(position >> 8),
                             0, 0, uint8_t(SPEED), uint8_t(SPEED >> 8)};
-  sendWrite(params, sizeof(params));
+  sendPacket(3, params, sizeof(params));
+}
+
+int readPosition() {
+  while (servo.available()) servo.read();
+  const uint8_t params[] = {56, 2};  // 現在位置を2バイト読む。
+  sendPacket(2, params, sizeof(params));
+
+  // 先頭の FF は回路の待機電位で崩れることがあるため、2番目の FF から検証する。
+  uint8_t reply[7] = {};
+  int count = 0;
+  unsigned long start = millis();
+  while (millis() - start < 50) {
+    if (!servo.available()) continue;
+    uint8_t byte = servo.read();
+    if (count < 7) reply[count++] = byte;
+    if (count < 7) continue;
+    uint8_t sum = 0;
+    for (int i = 1; i < 7; ++i) sum += reply[i];
+    if (reply[0] == 0xff && reply[1] == SERVO_ID &&
+        reply[2] == 4 && reply[3] == 0 && sum == 0xff) {
+      int position = reply[4] | (reply[5] << 8);
+      return position <= 4095 ? position : -1;
+    }
+    for (int i = 1; i < 7; ++i) reply[i - 1] = reply[i];
+    count = 6;
+  }
+  return -1;
+}
+
+void printPosition() {
+  int position = readPosition();
+  if (position < 0) Serial.println("Position read failed");
+  else { Serial.print("Position: "); Serial.println(position); }
 }
 
 void setup() {
   Serial.begin(115200);
-  pinMode(PIN_D04, OUTPUT);
-  digitalWrite(PIN_D04, HIGH);
-  txPin = reinterpret_cast<volatile uint32_t *>(get_gpio_regaddr(pin_convert(PIN_D04)));
-  DEMCR |= 1u << 24;
-  DWT_CYCCNT = 0;
-  DWT_CTRL |= 1;
-  bitCycles = clockCyclesPerMicrosecond();
+  servo.begin(115200);
+  digitalWrite(PIN_D04, HIGH);  // 送信していない間は High。
   delay(1000);
+
   // 1. トルクを有効にする。
   const uint8_t torque[] = {40, 1};
-  sendWrite(torque, sizeof(torque));
-  // 2. 位置 2048 を基準に、約18度動かして戻す。
+  sendPacket(3, torque, sizeof(torque));
+  // 2. 中央から左右それぞれ約90度動かし、中央に戻す。
   Serial.println("Moving to 2048");
   moveTo(2048);
   delay(8000);
-  Serial.println("Moving to 2248");
-  moveTo(2248);
-  delay(3000);
+  printPosition();
+  Serial.println("Moving to 3072");
+  moveTo(3072);
+  delay(9000);
+  printPosition();
+  Serial.println("Moving to 1024");
+  moveTo(1024);
+  delay(9000);
+  printPosition();
   Serial.println("Moving to 2048");
   moveTo(2048);
-  delay(3000);
-  Serial.println("Commands sent; visual confirmation required");
+  delay(9000);
+  printPosition();
+  Serial.println("Finished");
 }
 
-// 起動時に一度だけ動かす。リセットすると再実行する。
-void loop() { delay(1000); }
+void loop() { delay(1000); }  // リセットすると再実行する。
