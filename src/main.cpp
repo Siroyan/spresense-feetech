@@ -3,7 +3,10 @@
 
 // サーボ ID 1、115200 bps。D2 は受信、D4 は送信。
 constexpr uint8_t SERVO_ID = 1;
-constexpr uint16_t SPEED = 300;
+constexpr uint16_t SPEED = 2000;
+constexpr int CENTER = 2048;
+constexpr int OFFSET = 171;  // 約15度（4096ステップ = 360度）
+constexpr unsigned long HALF_PERIOD_MS = 500;
 SoftwareSerial servo(PIN_D02, PIN_D04);
 
 // FEETECH のパケット: FF FF ID 長さ 命令 パラメータ チェックサム。
@@ -23,7 +26,7 @@ void sendPacket(uint8_t instruction, const uint8_t *params, uint8_t count) {
 
 void moveTo(int position) {
   // レジスタ41から、加速度・位置・時間・速度を順に書き込む。
-  const uint8_t params[] = {41, 50, uint8_t(position), uint8_t(position >> 8),
+  const uint8_t params[] = {41, 254, uint8_t(position), uint8_t(position >> 8),
                             0, 0, uint8_t(SPEED), uint8_t(SPEED >> 8)};
   sendPacket(3, params, sizeof(params));
 }
@@ -70,24 +73,24 @@ void setup() {
   // 1. トルクを有効にする。
   const uint8_t torque[] = {40, 1};
   sendPacket(3, torque, sizeof(torque));
-  // 2. 中央から左右それぞれ約90度動かし、中央に戻す。
-  Serial.println("Moving to 2048");
-  moveTo(2048);
+  // 2. 最初に中央へ移動してから、往復を開始する。
+  Serial.println("Moving to center");
+  moveTo(CENTER);
   delay(8000);
   printPosition();
-  Serial.println("Moving to 3072");
-  moveTo(3072);
-  delay(9000);
-  printPosition();
-  Serial.println("Moving to 1024");
-  moveTo(1024);
-  delay(9000);
-  printPosition();
-  Serial.println("Moving to 2048");
-  moveTo(2048);
-  delay(9000);
-  printPosition();
-  Serial.println("Finished");
 }
 
-void loop() { delay(1000); }  // リセットすると再実行する。
+void loop() {
+  static bool positive = false;
+  int target = CENTER + (positive ? OFFSET : -OFFSET);
+  positive = !positive;
+
+  // 3. 0.5秒ごとに目標を反転する（往復1秒）。
+  unsigned long start = millis();
+  Serial.print("Target: "); Serial.print(target);
+  Serial.print(" at ms: "); Serial.println(start);
+  moveTo(target);
+  delay(400);
+  printPosition();  // 次に反転する前に到達位置を確認する。
+  while (millis() - start < HALF_PERIOD_MS) delay(1);
+}
